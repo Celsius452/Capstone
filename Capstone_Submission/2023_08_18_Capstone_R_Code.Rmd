@@ -1,0 +1,762 @@
+---
+title: "Performing a Harmony integrated analysis of pancreatic islet data"
+author: "Brandon Thong"
+date: "2023-08-18"
+output: 
+  html_document:
+    toc: true
+    number_selections: true
+    toc_float: true
+  pdf_document:
+    toc: true
+---
+
+
+```{r setup, include=FALSE}
+#To prevent errors and warnings from displaying in the knitted document
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+
+# Introduction
+
+This project had me working with Kesava Asam under Brad Aouizerat to perform a scRNA-seq analysis of pancreatic islet data from patients under differing diabetic/non-diabetic status. A recent publication by Wang et al., of which this data was sourced, investigated beta cell dysfunction in type 2 diabetes. Thus, I was directed and guided to obtain the data from this experiment and perform an integrated analysis on the beta cells, utilizing Harmony for integration and SingleR for cell type identity annotation. From this data, we were able to perform a differential gene expression analysis. 
+
+
+# Preface
+
+This document will consist of the execution of Seurat's scRNA-seq analysis on pancreatic islet data collected from patients of varying diabetic condition, which may be found under the accession number GSE200044. However, this version will utilize Harmony instead of Seurat's integration.
+
+The data found for this experiment will be subset to focus on the Non-diabetic (ND) and Type-2 Diabetic (T2D) patients, with the purpose of performing/confirming quality control, performing an integrated analysis, annotating clusters with SingleR, and comparing the data to find cell-type specific responses between ND and T2D.
+
+Note that due to due to Brightspace's upload size limit, the original "multiome_RNA_raw.h5ad" cannot be included in this submission. To re-run this RMarkdown document, create a folder named "GSE200044_Files" containing the GSE200044_cell_cluster file from the GEO page for GSE200044 and place it in the same project directory as this file. The path should read as shown in the section "Convert from h5ad to seurat object". 
+
+
+
+# Packages
+
+```{r eval=FALSE, include=FALSE}
+# Update
+update.packages()
+
+## From Cran
+package_list <- 
+  c("BiocManager", "tidyverse", "janitor", "devtools", 
+    "Seurat", "here", "janitor", "harmony", "patchwork",
+    "gridExtra")
+
+for(package in package_list) {           
+  if (!requireNamespace(package, quietly = TRUE))
+    install.packages(package, ask = F)                  
+}
+
+### Bioconductor
+package_list <- 
+  c("GEOquery", "SingleR", "celldex", "scRNAseq", "ExperimentHub", 
+    "scater", "scran")
+
+for(package in package_list) {           
+  if (!requireNamespace(package, quietly = TRUE))
+    BiocManager::install(package, ask = F)                  
+}
+
+## From github
+devtools::install_github("mojaveazure/seurat-disk")
+devtools::install_github('satijalab/seurat-data')
+```
+
+
+```{r results='hide', message=F, warning=F}
+library(SeuratDisk) # To convert h5ad to h5seurat
+library(tidyverse) # Manipulation of the dataframes
+library(janitor) # clean_names()
+library(Seurat) # scRNA sequences
+library(SeuratData)
+library(ggplot2) #figures
+library(GEOquery) # to get the phenotype
+library(here) # to avoid setting working directory
+library(SingleR) #To perform automated cell type annotation
+library(celldex) #For reference expression datasets for sc-annotation
+library(scRNAseq) #for use with providing reference dataset for annotation
+library(ExperimentHub) #for assisting with annotation
+library(scater) #for sc-analysis tools
+library(harmony) #for integration
+library(patchwork)
+library(gridExtra) #for plotting more conveniently
+library(scran) #For enabling further use of SingleR
+library(pheatmap) #for heatmap generation
+```
+
+
+# Get Phenotype Data 
+
+
+```{r}
+# Get the phenotype data from the Geo 
+gseGEO_test <- getGEO("GSE200044", GSEMatrix = F)
+gseGEO <- getGEO("GSE200044")
+gse <- gseGEO[[1]]
+
+# Get the phenotype file
+pheno_dft <- 
+  pData(gse)
+
+# select required columns
+pheno <- 
+  pheno_dft %>% 
+  dplyr::select(c(geo_accession, contains(":ch1"), library_strategy))  %>% 
+  janitor::clean_names()
+
+# rename the columns to remove un-necessary characters
+names(pheno) <- 
+  sub("_ch1", "", names(pheno))
+
+# subset only RNA data
+pheno_rna <- 
+  pheno %>% 
+  filter(library_strategy == "RNA-Seq")
+```
+
+This code was used to obtain the appropriate GEO phenotype data, 
+which will be merged and used with the Seurat object created in the following step.
+
+
+
+
+# Convert from h5ad to seurat object
+
+```{r eval=FALSE, include=TRUE}
+# convert the h5ad file into h5seurat file format
+
+#This only needs to be performed once, to create the original Seurat object
+SeuratDisk::Convert(here("GSE200044_Files/cell_cluster/multiome_RNA_raw.h5ad"),
+                    dest = "h5seurat",
+                    assay = "RNA")
+```
+
+
+```{r}
+# Make seurat object of all samples together that are in the file
+merged_data <- LoadH5Seurat(here(
+  "GSE200044_Files/cell_cluster/multiome_RNA_raw.h5Seurat"))
+```
+
+
+```{r}
+#Rename columns for clarity/consistency and merge the phenotypic data
+
+# create a sample column
+merged_data$row_names <- rownames(merged_data@meta.data)
+
+# add the subsetted metadata downloaded from geo
+merged_data@meta.data <- 
+  merge(merged_data@meta.data, pheno_rna, 
+                            by.x = "donor", by.y = "sample_id")
+           
+#Rename counts and genes columns
+names(merged_data@meta.data)[names(merged_data@meta.data)=='n_counts'] <- 
+  'nCount_RNA'
+names(merged_data@meta.data)[names(merged_data@meta.data)=='n_genes'] <- 
+  'nFeature_RNA'
+           
+# check the merged metadata 
+merged_data@meta.data %>% 
+  head()
+
+
+# re-add the rownames
+merged_data@meta.data <- 
+  merged_data@meta.data %>% 
+  column_to_rownames("row_names")
+```
+
+
+```{r}
+# check the metadata 
+merged_data@meta.data %>% head()
+```
+
+
+```{r}
+merged_data@meta.data %>% 
+  tail()
+```
+
+
+
+## Check basic information about this Seurat object
+
+
+The samples under each condition are shown below. 
+
+We will proceed focusing on just the ND and T2D groups.
+
+Non-diabetic:  C0026, C0027, A0019, A0033, A0027, C0025
+
+Pre-T2D: A0011, A0028, A0029, C0013, C0014, A0030, A0021, C0022
+
+T2D: C0019, C0024, C0021, A0024, A0031, C0023
+
+
+```{r}
+#Check disease state labels
+unique(merged_data$disease_state)
+```
+```{r}
+#Check number of each disease state
+length(which(merged_data$disease_state=='Pre-T2D'))
+length(which(merged_data$disease_state=='Non-diabetic'))
+length(which(merged_data$disease_state=='T2D'))
+```
+```{r}
+#Check amount of M vs F
+length(which(merged_data$gender=='M'))
+length(which(merged_data$gender=='F'))
+```
+
+
+
+
+
+
+# Subset the ND and T2D samples 
+
+```{r}
+#Subset, not including any rows including the Pre-T2D disease state
+merged_data_ND_T2D <- subset(merged_data, disease_state != 'Pre-T2D')
+#Display the first few entries
+head(merged_data_ND_T2D$disease_state)
+#Confirm that Pre-T2D entries have been removed
+unique(merged_data_ND_T2D$disease_state)
+```
+```{r}
+#Sanity check for object new object's class
+class(merged_data_ND_T2D)
+```
+
+
+
+
+
+
+
+# Quality Control and Filtering
+
+
+## Calculate mitochondrial percentage
+
+```{r}
+#Use the PercentagegFeatureSet() function to identify the percentage of 
+# counts originating from mitochondrial genes identified with '^MT-'
+merged_data_ND_T2D$my_percent_mito <- 
+  PercentageFeatureSet(merged_data_ND_T2D, pattern = '^MT-')
+
+#use view(merged_GSE_seurat) to see results more clearly 
+head(merged_data_ND_T2D$my_percent_mito)
+```
+
+
+## Visualizing QC metrics
+
+
+```{r}
+#Visualize QC metrics before filtering
+VlnPlot(merged_data_ND_T2D, features = c("nFeature_RNA", 
+                                                    "nCount_RNA", 
+                                                    "my_percent_mito"),
+        ncol = 3)
+```
+```{r fig.height=10, fig.width=15}
+#Visualize relationships with FeatureScatter
+
+plot1 <- FeatureScatter(merged_data_ND_T2D, feature1 = "nCount_RNA",
+                        feature2 = "my_percent_mito")
+plot2 <- FeatureScatter(merged_data_ND_T2D, feature1 = "nCount_RNA", 
+                        feature2 = "nFeature_RNA")
+plot1 + plot2
+```
+
+Fortunately, in the FeatureScatter plot for nFeature_RNA, we do not see any points in the top left or bottom right, which would indicate that the experiment captured a high number of genes that are not deeply sequenced, or the experiment has only captured a few genes which have been sequenced over and over again, respectively. 
+
+Percent mitochondrial transcripts already seems to be tidy and have a limit of 10%, and the nFeature_RNA plot similarly has no obvious outliers in its distribution. It seems likely that the data obtained from the GEO page has already been somewhat processed. 
+
+## Filtering
+
+
+Percent mitochondrial seems to have already been pre-processed in the source file to have a cutoff of 10%, which I agree with referencing the following article:
+[This article suggests a 10% cutoff as appropriate for human tissues, rather than 5%](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC8599307/)
+
+This is also consistent with the cutoff chosen in the 
+
+However, we will filter at 10% regardless to confirm. 
+
+There are also no obvious visual outliers in the nFeature_RNA graph, so we will just use a cutoff for the lower end, requiring a minimum of nFeature_RNA > 200 as is the standard.
+
+
+```{r}
+#The data already appears to have been filtered satisfactorily to these settings,
+#   but we shall run it anyways to be certain
+
+merged_data_ND_T2D_filtered <- subset(merged_data_ND_T2D, 
+                                                 subset = nFeature_RNA > 200 & 
+                                my_percent_mito < 10)
+```
+
+
+
+
+# Determining dimensionality of data before clustering
+
+```{r}
+#normalize data
+merged_data_ND_T2D_filtered <- 
+  NormalizeData(object = merged_data_ND_T2D_filtered)
+#find variable features
+merged_data_ND_T2D_filtered <- 
+  FindVariableFeatures(object = merged_data_ND_T2D_filtered)
+#Scale data
+merged_data_ND_T2D_filtered <- 
+  ScaleData(object = merged_data_ND_T2D_filtered)
+#Perform dimensionality reduction
+merged_data_ND_T2D_filtered <- 
+  RunPCA(object = merged_data_ND_T2D_filtered)
+
+```
+
+We can visualize the most highly variable genes found by FindVariableFeatures.
+
+
+```{r}
+#Identify and plot the top 10 highly variable genes
+top10 <- head(VariableFeatures(merged_data_ND_T2D_filtered), 10)
+top10_plot <- VariableFeaturePlot(merged_data_ND_T2D_filtered)
+LabelPoints(plot = top10_plot, points = top10, repel = TRUE)
+```
+
+
+
+
+
+We can use Elbow Plot to approximate the dimensionality. It is a commonly used heuristic and is much faster than methods such as JackStraw.
+
+
+
+```{r}
+#Check dimensionality to 50 dims
+ElbowPlot(merged_data_ND_T2D_filtered, ndims = 50)
+```
+
+
+We will use a Standard Deviation of 1 to select our cutoff, which appears to be approximately 40. We will use 40 PCs moving forward.
+
+This cutoff was chosen due to there still being a decline after the "more obvious elbow" around 12 PCs until around 40, as well as to be a bit more liberal because Elbow Plots can be visually subjective and underestimate the dimensionality. 
+
+
+We can also create a pre-integration plot to compare to post-integration.
+
+```{r}
+#Run UMAP and display the pre-integration plot
+merged_data_ND_T2D_filtered <- 
+  RunUMAP(merged_data_ND_T2D_filtered, dims = 1:40, reduction = 'pca')
+before <- 
+  DimPlot(merged_data_ND_T2D_filtered, 
+          reduction = 'umap', group.by = "disease_state")
+```
+
+
+
+# Perform Integration and Analysis
+
+
+We will use Harmony to perform integration and perform an integrated analysis.
+
+
+
+## Now perform the Harmony integration
+
+```{r}
+ND_T2D.harmony <- merged_data_ND_T2D_filtered %>% 
+  RunHarmony(group.by.vars = "disease_state", plot_convergence = FALSE)
+```
+```{r}
+#We can check the reductions in the harmony object
+ND_T2D.harmony@reductions
+
+#We will specify our harmony reductions in the future when doing clustering
+
+#Let's also save our harmony embeddings
+ND_T2D.harmony.embed <- Embeddings(ND_T2D.harmony, "harmony")
+```
+
+```{r eval=FALSE, include=FALSE}
+#And check the embeddings
+ND_T2D.harmony.embed[1:10,1:10]
+```
+
+
+## Perform UMAP and downstream clustering using Harmony embeddings instead of PCA
+
+```{r}
+ND_T2D.harmony <- ND_T2D.harmony %>% 
+  RunUMAP(reduction = 'harmony', dims = 1:40) %>%
+  FindNeighbors(reduction = 'harmony', dims = 1:40) %>%
+  FindClusters(resolution = 0.5)
+```
+ScaleData() and RunPCA() are not used here, since Harmony will take over those steps, and we use Harmony embeddings instead of PCA for the UMAP and clustering.
+
+
+
+## Also run at 1.0 and 1.5 resolution
+
+The original article used a resolution of 1.5, using all of the original data.
+
+We can take a look at Harmony's clustering at that resolution as well as at 1.0, which may be interesting because our dataset is a subset of what was performed in the paper.
+
+```{r}
+ND_T2D.harmony <- ND_T2D.harmony %>% 
+  FindClusters(resolution = 1.0)
+
+ND_T2D.harmony <- ND_T2D.harmony %>% 
+  FindClusters(resolution = 1.5)
+```
+
+
+
+## Visualize before v after
+```{r}
+#We use the umap reduction here, since it was calculated from Harmony in the 
+## previous step
+after <- DimPlot(ND_T2D.harmony, reduction = 'umap', group.by = 'disease_state')
+```
+
+
+
+
+```{r fig.height=6, fig.width=12}
+#plot
+before|after
+```
+
+
+
+
+```{r fig.height=6, fig.width=15}
+# Visualization of clusters
+p1 <- DimPlot(ND_T2D.harmony, reduction = "umap", group.by = "disease_state")
+p2 <- DimPlot(ND_T2D.harmony, reduction = "umap", label = TRUE, repel = TRUE)
+p1 + p2
+```
+
+```{r fig.height=6, fig.width=15}
+#Assign identity of clusters
+Idents(object = ND_T2D.harmony) <- "RNA_snn_res.0.5"
+
+DimPlot(ND_T2D.harmony, reduction = "umap", split.by = "disease_state", 
+        label = TRUE)
+```
+
+
+
+
+
+## We can also compare to the 1.0 and 1.5 resolution clustering
+
+
+```{r}
+#Assign identity of clusters
+Idents(object = ND_T2D.harmony) <- "RNA_snn_res.1"
+
+#Plot UMAP
+DimPlot(ND_T2D.harmony,
+        reduction = "umap",
+        label = TRUE)
+```
+
+```{r}
+#Assign identity of clusters
+Idents(object = ND_T2D.harmony) <- "RNA_snn_res.1.5"
+
+#Plot UMAP
+DimPlot(ND_T2D.harmony,
+        reduction = "umap",
+        label = TRUE)
+```
+
+
+
+
+
+
+
+
+
+
+
+We can also check the Harmony assays again to see the top 10 variable features
+
+```{r}
+ND_T2D.harmony@assays
+```
+
+Let's proceed with the 1.5 resolution the article chose, since we have a high number of cells (54.5k).
+
+The Ident will remain as the last one that was set, which is the 1.5 resolution in our case. 
+
+
+
+
+# Label clusters with SingleR for cell type annotation 
+
+We will use SingleR to propagate the marker gene definition and cluster interpretation from the Baron Pancreas Dataset to our own data.
+
+This will allow the annotation process to be swift and automated, which improves upon the speed and accuracy when compared to manual annotation. 
+
+```{r}
+#Load Baron Human pancreas dataset
+Baron_Pancreas <- BaronPancreasData('human')
+Baron_Pancreas
+```
+
+```{r}
+#Remove the unlabeled libraries here
+Baron_Pancreas <- Baron_Pancreas[,!is.na(Baron_Pancreas$label)]
+
+#SingleR expects normalized and log-transformed reference datasets
+Baron_Pancreas <- logNormCounts(Baron_Pancreas)
+```
+
+
+
+
+
+## SingleR function call
+
+This is performed after our clustering from integration. However, we will make sure to be using the RNA assay instead of the Integrated assay, since we will soon be looking at the differentially expressed genes. 
+
+This will be performed after the integrated analysis, where we would typically perform the "conserved cell type markers" step.
+
+Since SingleR will annotate cell labels automatically for our dataset, let's use it now with the Baron pancreatic islet dataset as reference.
+
+
+```{r}
+#Now perform singleR using the same test dataset, but using Baron as ref
+
+#Ensure we are using RNA assay for differential expression after integration
+DefaultAssay(ND_T2D.harmony) <- "RNA"
+
+singleR_results_ND_T2D <- SingleR(test = as.SingleCellExperiment(ND_T2D.harmony), 
+                    ref = Baron_Pancreas, labels = Baron_Pancreas$label, 
+                    de.method = "wilcox")
+table(singleR_results_ND_T2D$labels)
+```
+
+```{r eval=FALSE, include=FALSE}
+singleR_results_ND_T2D
+```
+
+```{r}
+#Append metadata with these new labels
+ND_T2D.harmony$Baron_singleR_labels <- singleR_results_ND_T2D$labels
+
+#and check
+head(ND_T2D.harmony[[]])
+```
+
+```{r fig.height=8, fig.width=15}
+#Plot labels and clusters with DimPlot
+
+DimPlot(ND_T2D.harmony, reduction = 'umap', 
+        group.by = 'Baron_singleR_labels', label = T, repel = T)
+```
+
+We can also display a heatmap of the score matrix from SingleR, which will indicate our level of certainty of our assignments.
+
+```{r fig.height=8, fig.width=15}
+plotScoreHeatmap(singleR_results_ND_T2D)
+```
+
+While our heatmap could be more distinct, there is easily visible distinction in the difference in scores for the cell types that make up a bulk of the data, such as alpha, beta, gamma, and delta cells. 
+
+Since there is clear difference in scores for alpha and beta cells compared to the rest, we can proceed with further analysis on these cells. 
+
+```{r fig.height=10, fig.width=15}
+#Also look at delta distribution
+#Labels with very low deltas may need to be cautiously interpreted
+plotDeltaDistribution(singleR_results_ND_T2D)
+```
+
+
+
+
+
+```{r eval=FALSE, include=FALSE}
+#We can look at the marker genes used for each cell type label against the others.
+
+
+#We can check the marker genes used for each label
+## We will use them to visualize their expression values across the test dataset
+singleR_marker_genes <- metadata(singleR_results_ND_T2D)$de.genes
+head(singleR_marker_genes)
+```
+
+
+
+# Plot the ND and T2D conditions for each cluster
+
+
+```{r}
+#Prepare a column with the labels and condition combined for use in FindMarkers
+ND_T2D.harmony$celltype.cnd <- paste(ND_T2D.harmony$Baron_singleR_labels, "_",
+                                      ND_T2D.harmony$disease_state)
+```
+
+```{r}
+#Set Idents to this new column
+Idents(ND_T2D.harmony) <- ND_T2D.harmony$celltype.cnd
+```
+
+
+Lets plot our newly labeled ND_T2D.harmony, showing our ND and T2D conditions for each of the cluster identities.
+
+
+```{r fig.height=10, fig.width=15}
+#Check plot of current state of ND_T2D.harmony
+DimPlot(ND_T2D.harmony, reduction = "umap", label = TRUE)
+```
+
+
+# Use FindMarkers to compare beta cells beween the ND and T2D conditions
+
+
+We will now use FindMarkers to leverage the updated identities of the cells and compare the diabetic conditions
+
+```{r}
+beta_t2d_response <- FindMarkers(ND_T2D.harmony, ident.1 = "beta _ T2D", 
+                                 ident.2 = "beta _ Non-diabetic")
+```
+
+```{r}
+#Let's inspect the results
+head(beta_t2d_response, n=10)
+```
+
+
+This object contains genes found to be differentially expressed when comparing between the ND and T2D conditions. The most biologically significant genes in this are the ones most up/down-regulated between the T2D and ND groups. 
+
+However, it is important to note the pct.1 and pct.2 signify the percentage of cells where the gene is detected, so the output shown above is ordered in such a way these are taken into consideration.
+
+Let's plot some of these DE features.
+
+
+
+# Let's plot expression of features/markers detected by findmarkers
+
+
+
+```{r fig.height=15, fig.width=10}
+#Lets plot the differential expression of the markers found in the previous 
+# step between the two conditions
+
+#This is amongst all clusters
+
+
+#Plot the first four
+FeaturePlot(ND_T2D.harmony, features = c("PDE4B", "SGIP1", "MARK1", "RYR2"), 
+            split.by = "disease_state", min.cutoff = 'q10')
+```
+```{r fig.height=10, fig.width=10}
+
+#And the next 3
+FeaturePlot(ND_T2D.harmony, features = c("KIF26B", "EML6", "ZBTB20"), 
+            split.by = "disease_state", min.cutoff = 'q10')
+```
+
+
+
+We can also look at some of the genes with the most dramatic up/down-regulation, regardless of pct.1 and pct.2.
+
+
+If we check the beta_t2d_response object and look at the top 3 most positively and negative log2FC genes with extremely low p-values, we obtain the following log2FC:
+
+(+)
+XIST: 1.718       
+PRUNE2: 1.393
+RYR2: 1.361
+
+(-)
+INS: -1.504
+AGPAT5: -1.411
+UTY: -1.160
+
+
+
+Positive values for log2FC means the gene is more expressed in the T2D condition, and negative indicates the gene is lowly expressed in the T2D condition when compared to ND.
+
+
+
+```{r fig.height=10, fig.width=10}
+#Now lets first plot the upregulated genes
+FeaturePlot(ND_T2D.harmony, features = c("XIST", "PRUNE2", "RYR2"), 
+            split.by = "disease_state", min.cutoff = 'q10')
+```
+
+
+At first, we see an upregulation in XIST in the T2D condition, which at first seems odd since this gene is typically only expressed in females as it produces a long noncoding RNA that initiates chromosome-wide gene repression on the inactive X chromosome in mammalian females. However, this can be explained by the gender imbalance of the dataset that was inspected previously, with a roughly 5:2 ratio of M:F.
+
+```{r eval=FALSE, include=FALSE}
+#Check amount of M vs F
+length(which(merged_data$gender=='M'))
+length(which(merged_data$gender=='F'))
+```
+
+
+```{r fig.height=10, fig.width=10}
+#Now lets plot the DOWNregulated genes
+FeaturePlot(ND_T2D.harmony, features = c("INS", "AGPAT5", "UTY"), 
+            split.by = "disease_state", min.cutoff = 'q10')
+```
+
+
+We can plot some additional genes of interest, which affect regulation of insulin.
+
+```{r fig.height=10, fig.width=10}
+#And lets plot TCF7L2 which affects insulin secretion, and ABCC8
+# which helps regulate insulin
+
+FeaturePlot(ND_T2D.harmony, features = c("TCF7L2", "ABCC8"), 
+            split.by = "disease_state", min.cutoff = 'q10')
+```
+```{r}
+#And their avg log2FC
+
+print("TCF7L2:")
+beta_t2d_response["TCF7L2","avg_log2FC"]
+
+print("ABCC8:")
+beta_t2d_response["ABCC8","avg_log2FC"]
+```
+
+
+
+
+We can also use Violin Plots to display these changes in gene expression.
+
+
+```{r fig.height=10, fig.width=10}
+violin_plot1 <- VlnPlot(ND_T2D.harmony, features = c("INS","MARK1","PRUNE2"), 
+                        split.by = "disease_state", 
+                        group.by = "Baron_singleR_labels", 
+                        pt.size = 0, combine = FALSE)
+wrap_plots(plots = violin_plot1, ncol = 1)
+```
+
+
+
+
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+
